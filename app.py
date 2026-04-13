@@ -266,6 +266,7 @@ with st.sidebar:
         "🏋️ Training",
         "📈 Evaluasi Model",
         "🔥 Grad-CAM (XAI)",
+        "🧪 Uji Coba Model",
         "📋 Ringkasan & Kesimpulan"
     ])
 
@@ -913,6 +914,664 @@ elif page == "🔥 Grad-CAM (XAI)":
                 <div style="font-size:0.88rem;color:#c9d8ed;margin-top:4px;">{desc}</div>
             </div>
         </div>""", unsafe_allow_html=True)
+
+# ─── HALAMAN UJI COBA MODEL ───────────────────────────────────────────────────
+elif page == "🧪 Uji Coba Model":
+    st.markdown('<div class="hero-title">Uji Coba Model</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-sub">Upload Gambar · Prediksi Real Model .h5 · Grad-CAM · Analisis Sentimen</div>', unsafe_allow_html=True)
+
+    # ── Import TensorFlow di sini agar tidak memperlambat halaman lain ────────
+    try:
+        import tensorflow as tf
+        TF_AVAILABLE = True
+    except ImportError:
+        TF_AVAILABLE = False
+
+    from PIL import Image as PILImage
+    import io
+    from collections import Counter
+
+    # ── Path model ─────────────────────────────────────────────────────────────
+    model_paths = {
+        'VGG16':       'models/VGG16.h5',
+        'DenseNet121': 'models/DenseNet121.h5',
+        'MobileNetV2': 'models/MobileNetV2.h5',
+    }
+    layer_map = {
+        'VGG16':       'block5_conv3',
+        'DenseNet121': 'conv5_block16_2_conv',
+        'MobileNetV2': 'Conv_1',
+    }
+    class_colors_map = {'positif': '#34d399', 'netral': '#60a5fa', 'negatif': '#f87171'}
+    class_icons_map  = {'positif': '😊', 'netral': '😐', 'negatif': '😠'}
+
+    # ── Fungsi load model dengan cache ─────────────────────────────────────────
+    @st.cache_resource(show_spinner=False)
+    def load_model_h5(path):
+        """Load model .h5 dari disk. Return (model, error_message)."""
+        if not TF_AVAILABLE:
+            return None, "TensorFlow tidak terinstall di environment ini."
+        if not os.path.exists(path):
+            return None, f"File tidak ditemukan: `{path}`"
+        try:
+            model = tf.keras.models.load_model(path, compile=False)
+            return model, None
+        except Exception as e:
+            return None, str(e)
+
+    # ── Fungsi prediksi nyata ───────────────────────────────────────────────────
+    def predict_real(model, img_norm):
+        """
+        Prediksi menggunakan model nyata.
+        img_norm: numpy array (224, 224, 3) dengan nilai [0,1].
+        Return: (probs array shape (3,), pred_class int, confidence float)
+        """
+        img_input = np.expand_dims(img_norm, axis=0).astype(np.float32)
+        preds = model.predict(img_input, verbose=0)  # shape (1, 3)
+        probs = preds[0]
+        pred_class = int(np.argmax(probs))
+        confidence = float(probs[pred_class])
+        return probs, pred_class, confidence
+
+    # ── Fungsi Grad-CAM nyata dengan GradientTape ──────────────────────────────
+    def compute_gradcam_real(model, img_norm, pred_class, last_conv_layer_name):
+        """
+        Hitung Grad-CAM nyata dari model .h5.
+        Mengembalikan heatmap 2D bernilai [0,1] berukuran sama dengan img_norm.
+        """
+        img_input = tf.cast(np.expand_dims(img_norm, axis=0), tf.float32)
+
+        # Buat model intermediate: input → last conv layer output + final output
+        try:
+            last_conv_layer = model.get_layer(last_conv_layer_name)
+        except ValueError:
+            # Coba cari layer konvolusi terakhir secara otomatis
+            conv_layers = [l for l in model.layers
+                           if isinstance(l, (tf.keras.layers.Conv2D,
+                                             tf.keras.layers.DepthwiseConv2D))]
+            if not conv_layers:
+                return None
+            last_conv_layer = conv_layers[-1]
+
+        grad_model = tf.keras.models.Model(
+            inputs=model.inputs,
+            outputs=[last_conv_layer.output, model.output]
+        )
+
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = grad_model(img_input)
+            loss = predictions[:, pred_class]
+
+        grads = tape.gradient(loss, conv_outputs)  # (1, h, w, filters)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))  # (filters,)
+
+        conv_outputs = conv_outputs[0]  # (h, w, filters)
+        # Bobot setiap feature map
+        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]  # (h, w, 1)
+        heatmap = tf.squeeze(heatmap)  # (h, w)
+        heatmap = tf.nn.relu(heatmap)  # hapus nilai negatif
+
+        # Normalisasi ke [0, 1]
+        heatmap = heatmap.numpy()
+        if heatmap.max() > 0:
+            heatmap = heatmap / heatmap.max()
+
+        # Resize ke 224×224
+        import cv2
+        heatmap_resized = cv2.resize(heatmap, (img_norm.shape[1], img_norm.shape[0]))
+        return heatmap_resized
+
+    def overlay_gradcam(img_norm, heatmap, alpha=0.45):
+        """Overlay heatmap Grad-CAM di atas gambar asli."""
+        heatmap_color = plt.cm.jet(heatmap)[:, :, :3]
+        overlay = np.clip((1 - alpha) * img_norm + alpha * heatmap_color, 0, 1)
+        return overlay
+
+    # ── Cek & tampilkan status model ───────────────────────────────────────────
+    st.markdown('<div class="section-header">📦 Status Model</div>', unsafe_allow_html=True)
+    if not TF_AVAILABLE:
+        st.error("❌ **TensorFlow tidak tersedia.** Install dengan: `pip install tensorflow`")
+        st.stop()
+
+    col_av1, col_av2, col_av3 = st.columns(3)
+    model_load_errors = {}
+    for col_av, mname in zip([col_av1, col_av2, col_av3], ['VGG16', 'DenseNet121', 'MobileNetV2']):
+        with col_av:
+            mpath = model_paths[mname]
+            exists = os.path.exists(mpath)
+            if exists:
+                status_icon, status_color, status_text = "✅", "#34d399", "File Ditemukan"
+                model_load_errors[mname] = None
+            else:
+                status_icon, status_color, status_text = "❌", "#f87171", "File Tidak Ada"
+                model_load_errors[mname] = f"File tidak ditemukan: `{mpath}`"
+            st.markdown(f"""
+            <div style="text-align:center;padding:12px;background:rgba(0,0,0,0.2);
+            border:2px solid {MODEL_COLORS[mname]}50;border-radius:12px;margin-bottom:8px;">
+                <div style="font-size:1.6rem;">{status_icon}</div>
+                <div style="color:{MODEL_COLORS[mname]};font-family:'Space Mono',monospace;
+                font-weight:700;font-size:0.95rem;margin-top:4px;">{mname}</div>
+                <div style="color:{status_color};font-size:0.78rem;margin-top:3px;
+                font-weight:600;">{status_text}</div>
+                <div style="color:#7ba4cc;font-size:0.7rem;margin-top:2px;">{mpath}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # Jika ada model yang tidak ditemukan, tampilkan error dan berhenti
+    missing = [m for m, err in model_load_errors.items() if err]
+    if missing:
+        st.markdown(f"""
+        <div style="background:rgba(248,113,113,0.1);border:1px solid #f87171;
+        border-radius:10px;padding:16px;margin:12px 0;">
+            <div style="color:#f87171;font-weight:700;font-size:1rem;margin-bottom:8px;">
+                ❌ Model Tidak Ditemukan — Tidak Dapat Melanjutkan
+            </div>
+            <div style="color:#fca5a5;font-size:0.88rem;line-height:1.7;">
+                File model berikut <strong>tidak ada</strong> di direktori proyek:<br>
+                {"".join(f"<code style='display:block;margin:4px 0;'>• {model_paths[m]}</code>" for m in missing)}
+                <br>
+                Pastikan Anda sudah melatih model dan menyimpannya ke folder <code>models/</code> 
+                di root direktori proyek Streamlit ini, lalu jalankan ulang aplikasi.
+            </div>
+        </div>""", unsafe_allow_html=True)
+        st.stop()
+
+    st.markdown("""
+    <div class="success-box">
+    ✅ <strong>Semua model ditemukan.</strong> Sistem siap melakukan prediksi nyata menggunakan 
+    ketiga model CNN. Silakan upload gambar di bawah untuk memulai.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Penjelasan cara kerja ───────────────────────────────────────────────────
+    st.markdown("""
+    <div class="info-box">
+    <strong>🧪 Cara Kerja Uji Coba:</strong>
+    <ol style="margin:8px 0 0 16px;color:#c9d8ed;">
+        <li><strong>Upload Gambar</strong> — Gambar JPG/PNG diunggah, kemudian dibaca sebagai array piksel RGB</li>
+        <li><strong>Preprocessing</strong> — Resize ke 224×224, normalisasi ke [0,1], tambahkan dimensi batch</li>
+        <li><strong>Prediksi Nyata</strong> — Setiap model .h5 menjalankan <code>model.predict()</code> dan menghasilkan probabilitas untuk 3 kelas</li>
+        <li><strong>Grad-CAM Nyata</strong> — <code>GradientTape</code> menghitung gradien dari layer konvolusi terakhir terhadap kelas yang diprediksi, lalu divisualisasikan sebagai heatmap</li>
+        <li><strong>Analisis</strong> — Hasil ketiga model dibandingkan dan diinterpretasikan</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Upload gambar ──────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📁 Upload Gambar untuk Diuji</div>', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader(
+        "Pilih gambar (JPG/PNG):",
+        type=['jpg', 'jpeg', 'png'],
+        help="Upload gambar untuk dianalisis oleh ketiga model CNN"
+    )
+
+    if uploaded_file is not None:
+        # Baca gambar
+        img_bytes = uploaded_file.read()
+        pil_img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+        img_original = np.array(pil_img)
+
+        # Tampilkan gambar asli
+        st.markdown('<div class="section-header">🖼️ Gambar yang Diupload</div>', unsafe_allow_html=True)
+        col_orig1, col_orig2, col_orig3 = st.columns([1, 2, 1])
+        with col_orig2:
+            st.image(img_original, caption=f"Gambar Asli · {img_original.shape[1]}×{img_original.shape[0]} piksel", use_container_width=True)
+            st.markdown(f"""
+            <div style="text-align:center;padding:6px;background:rgba(56,189,248,0.07);
+            border-radius:8px;font-family:'Space Mono',monospace;font-size:0.8rem;color:#7ba4cc;">
+                Format: {uploaded_file.type} · Ukuran file: {len(img_bytes)/1024:.1f} KB
+            </div>""", unsafe_allow_html=True)
+
+        # Preprocessing: resize + normalisasi
+        pil_resized = pil_img.resize((224, 224), PILImage.LANCZOS)
+        img_norm = np.array(pil_resized, dtype=np.float32) / 255.0  # (224,224,3) [0,1]
+
+        # Visualisasi preprocessing
+        st.markdown("---")
+        st.markdown('<div class="section-header">⚙️ Preprocessing Gambar</div>', unsafe_allow_html=True)
+        fig_pre, axes_pre = plt.subplots(1, 3, figsize=(14, 4), facecolor='none')
+        axes_pre[0].imshow(img_original)
+        axes_pre[0].set_title(f'Gambar Asli\n{img_original.shape[1]}×{img_original.shape[0]} px', color='#c9d8ed', fontsize=10)
+        axes_pre[0].axis('off')
+        axes_pre[1].imshow(pil_resized)
+        axes_pre[1].set_title('Setelah Resize\n224×224 px', color='#38bdf8', fontsize=10)
+        axes_pre[1].axis('off')
+        axes_pre[2].hist(img_norm[:,:,0].ravel(), bins=50, color='#f87171', alpha=0.6, label='R', density=True)
+        axes_pre[2].hist(img_norm[:,:,1].ravel(), bins=50, color='#4ade80', alpha=0.6, label='G', density=True)
+        axes_pre[2].hist(img_norm[:,:,2].ravel(), bins=50, color='#60a5fa', alpha=0.6, label='B', density=True)
+        axes_pre[2].set_title('Distribusi Pixel Ternormalisasi\n[0.0 – 1.0]', color='#34d399', fontsize=10)
+        axes_pre[2].set_xlabel('Nilai Pixel', color='#7ba4cc', fontsize=9)
+        axes_pre[2].set_ylabel('Densitas', color='#7ba4cc', fontsize=9)
+        axes_pre[2].legend(labelcolor='#c9d8ed', facecolor='#0d1829', edgecolor='#1e3a5f', fontsize=8)
+        axes_pre[2].set_facecolor('none')
+        axes_pre[2].tick_params(colors='#7ba4cc', labelsize=8)
+        axes_pre[2].spines[:].set_color('#1e3a5f')
+        for ax_p in axes_pre[:2]: ax_p.set_facecolor('none')
+        fig_pre.patch.set_alpha(0)
+        st.pyplot(fig_pre, transparent=True)
+        plt.close()
+
+        st.markdown("---")
+        st.markdown('<div class="section-header">🤖 Memuat Model & Menjalankan Prediksi Nyata...</div>', unsafe_allow_html=True)
+
+        # ── Load model & prediksi per model ────────────────────────────────────
+        all_predictions = {}
+        all_heatmaps    = {}
+        load_errors     = {}
+
+        for mname in ['VGG16', 'DenseNet121', 'MobileNetV2']:
+            with st.spinner(f"Memuat {mname} dan menghitung prediksi + Grad-CAM..."):
+                model, err = load_model_h5(model_paths[mname])
+                if err or model is None:
+                    load_errors[mname] = err or "Gagal load model."
+                    continue
+
+                # Prediksi nyata
+                try:
+                    probs, pred_class, confidence = predict_real(model, img_norm)
+                except Exception as e:
+                    load_errors[mname] = f"Error saat predict: {e}"
+                    continue
+
+                # Grad-CAM nyata
+                heatmap = None
+                try:
+                    heatmap = compute_gradcam_real(model, img_norm, pred_class, layer_map[mname])
+                except Exception as e:
+                    pass  # Grad-CAM gagal tidak menghentikan prediksi
+
+                all_predictions[mname] = {
+                    'probs':      probs,
+                    'pred_class': pred_class,
+                    'pred_label': CONFIG['class_names'][pred_class],
+                    'confidence': confidence,
+                }
+                all_heatmaps[mname] = heatmap
+
+        # Tampilkan error load jika ada
+        for mname, err in load_errors.items():
+            st.markdown(f"""
+            <div style="background:rgba(248,113,113,0.1);border:1px solid #f87171;
+            border-radius:10px;padding:12px;margin:6px 0;">
+                <strong style="color:#f87171;">❌ {mname} — Gagal diproses</strong><br>
+                <code style="color:#fca5a5;font-size:0.82rem;">{err}</code>
+            </div>""", unsafe_allow_html=True)
+
+        if not all_predictions:
+            st.error("❌ Tidak ada model yang berhasil dijalankan. Periksa error di atas.")
+            st.stop()
+
+        st.markdown("---")
+        st.markdown('<div class="section-header">📊 Hasil Prediksi per Model</div>', unsafe_allow_html=True)
+
+        # ── Tampilkan kartu hasil per model ────────────────────────────────────
+        model_cols = st.columns(len(all_predictions))
+        for col_m, mname in zip(model_cols, all_predictions.keys()):
+            with col_m:
+                pred_info  = all_predictions[mname]
+                pred_label = pred_info['pred_label']
+                confidence = pred_info['confidence']
+                probs      = pred_info['probs']
+                model_color = MODEL_COLORS[mname]
+                class_color = class_colors_map[pred_label]
+                class_icon  = class_icons_map[pred_label]
+
+                # Header kartu
+                st.markdown(f"""
+                <div style="text-align:center;padding:16px;
+                background:linear-gradient(135deg,rgba(13,24,41,0.95),rgba(19,32,53,0.95));
+                border:2px solid {model_color}70;border-radius:14px;margin-bottom:10px;">
+                    <div style="font-family:'Space Mono',monospace;font-weight:700;
+                    color:{model_color};font-size:1.05rem;">{mname}</div>
+                    <div style="font-size:2.2rem;margin:10px 0;">{class_icon}</div>
+                    <div style="font-size:1.3rem;font-weight:700;color:{class_color};
+                    font-family:'Space Mono',monospace;">{pred_label.upper()}</div>
+                    <div style="font-size:0.88rem;color:#7ba4cc;margin-top:6px;">
+                        Confidence:<br>
+                        <span style="color:{class_color};font-family:'Space Mono',monospace;
+                        font-weight:700;font-size:1.2rem;">{confidence*100:.2f}%</span>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+                # Gambar resize + Grad-CAM overlay
+                fig_res, axes_res = plt.subplots(1, 2, figsize=(6, 3), facecolor='none')
+                axes_res[0].imshow(img_norm)
+                axes_res[0].set_title('Input (224×224)', color='#c9d8ed', fontsize=8)
+                axes_res[0].axis('off')
+                axes_res[0].set_facecolor('none')
+
+                heatmap = all_heatmaps.get(mname)
+                if heatmap is not None:
+                    gc_overlay = overlay_gradcam(img_norm, heatmap, alpha=0.45)
+                    axes_res[1].imshow(gc_overlay)
+                    axes_res[1].set_title('Grad-CAM (Real)', color=model_color, fontsize=8)
+                else:
+                    axes_res[1].imshow(img_norm)
+                    axes_res[1].set_title('Grad-CAM\n(Gagal)', color='#f87171', fontsize=8)
+                axes_res[1].axis('off')
+                axes_res[1].set_facecolor('none')
+                fig_res.patch.set_alpha(0)
+                fig_res.tight_layout(pad=0.3)
+                st.pyplot(fig_res, transparent=True)
+                plt.close()
+
+                # Bar chart probabilitas nyata
+                fig_prob, ax_prob = plt.subplots(figsize=(4, 2.8), facecolor='none')
+                class_labels_bar = ['Positif', 'Netral', 'Negatif']
+                bar_colors_bar   = ['#34d399', '#60a5fa', '#f87171']
+                bars_prob = ax_prob.barh(class_labels_bar, probs * 100,
+                                         color=bar_colors_bar, alpha=0.85, height=0.5)
+                for bar_p, pv in zip(bars_prob, probs):
+                    ax_prob.text(bar_p.get_width() + 0.5,
+                                 bar_p.get_y() + bar_p.get_height()/2,
+                                 f'{pv*100:.2f}%', va='center', ha='left',
+                                 color='#c9d8ed', fontsize=8, fontfamily='monospace')
+                ax_prob.set_xlim(0, 118)
+                ax_prob.set_xlabel('Probabilitas (%)', color='#7ba4cc', fontsize=8)
+                ax_prob.set_title('Probabilitas Kelas', color='#c9d8ed', fontsize=9, fontweight='bold')
+                ax_prob.set_facecolor('none')
+                ax_prob.tick_params(colors='#7ba4cc', labelsize=8)
+                ax_prob.spines[:].set_color('#1e3a5f')
+                ax_prob.invert_yaxis()
+                fig_prob.patch.set_alpha(0)
+                fig_prob.tight_layout()
+                st.pyplot(fig_prob, transparent=True)
+                plt.close()
+
+                # Info layer
+                st.markdown(f"""
+                <div style="padding:8px 10px;background:rgba(0,0,0,0.3);border-radius:8px;
+                font-size:0.72rem;color:#7ba4cc;margin-top:4px;
+                font-family:'Space Mono',monospace;text-align:center;">
+                    Grad-CAM Layer:<br>
+                    <span style="color:{model_color};">{layer_map[mname]}</span>
+                </div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Tabel ringkasan semua model ─────────────────────────────────────────
+        st.markdown('<div class="section-header">📋 Tabel Ringkasan Prediksi</div>', unsafe_allow_html=True)
+        summary_rows = []
+        for mname in ['VGG16', 'DenseNet121', 'MobileNetV2']:
+            if mname not in all_predictions:
+                summary_rows.append({'Model': mname, 'Prediksi': '❌ Error', 'Confidence': '-',
+                                     'P(Positif)': '-', 'P(Netral)': '-', 'P(Negatif)': '-'})
+                continue
+            p  = all_predictions[mname]
+            pv = p['probs']
+            summary_rows.append({
+                'Model':       mname,
+                'Prediksi':    p['pred_label'].upper(),
+                'Confidence':  f"{p['confidence']*100:.2f}%",
+                'P(Positif)':  f"{pv[0]*100:.2f}%",
+                'P(Netral)':   f"{pv[1]*100:.2f}%",
+                'P(Negatif)':  f"{pv[2]*100:.2f}%",
+            })
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        # ── Diagram perbandingan grouped bar ───────────────────────────────────
+        if len(all_predictions) > 0:
+            st.markdown('<div class="section-header">📈 Diagram Sentimen Perbandingan Semua Model</div>', unsafe_allow_html=True)
+            st.markdown("""
+            <div class="info-box">
+            Diagram ini menampilkan probabilitas <strong>nyata</strong> dari model .h5 Anda untuk 
+            setiap kelas sentimen. Nilai berasal langsung dari output <code>softmax</code> model.
+            </div>
+            """, unsafe_allow_html=True)
+
+            fig_cmp, axes_cmp = plt.subplots(1, 2, figsize=(14, 5), facecolor='none')
+
+            # Grouped bar probabilitas
+            x_cmp      = np.arange(3)
+            w_cmp      = 0.25
+            cls_labels = ['Positif', 'Netral', 'Negatif']
+            mnames_ok  = list(all_predictions.keys())
+
+            for i, mname in enumerate(mnames_ok):
+                pv = all_predictions[mname]['probs'] * 100
+                bars_c = axes_cmp[0].bar(x_cmp + i * w_cmp, pv, w_cmp,
+                                          label=mname, color=MODEL_COLORS[mname], alpha=0.85)
+                for bc in bars_c:
+                    hc = bc.get_height()
+                    axes_cmp[0].text(bc.get_x() + bc.get_width()/2, hc + 0.5,
+                                     f'{hc:.1f}', ha='center', va='bottom',
+                                     color='#c9d8ed', fontsize=7, fontfamily='monospace')
+
+            axes_cmp[0].set_xticks(x_cmp + w_cmp * (len(mnames_ok)-1) / 2)
+            axes_cmp[0].set_xticklabels(cls_labels, color='#c9d8ed', fontsize=10)
+            axes_cmp[0].set_ylabel('Probabilitas (%)', color='#7ba4cc')
+            axes_cmp[0].set_title('Probabilitas per Kelas & Model\n(dari model nyata)', color='#c9d8ed', fontweight='bold')
+            axes_cmp[0].legend(labelcolor='#c9d8ed', facecolor='#0d1829', edgecolor='#1e3a5f', fontsize=9)
+            axes_cmp[0].set_facecolor('none')
+            axes_cmp[0].tick_params(colors='#7ba4cc')
+            axes_cmp[0].spines[:].set_color('#1e3a5f')
+            axes_cmp[0].grid(axis='y', alpha=0.15, color='#38bdf8')
+            axes_cmp[0].set_ylim(0, 110)
+
+            # Confidence per model
+            confs  = [all_predictions[m]['confidence'] * 100 for m in mnames_ok]
+            labels = [all_predictions[m]['pred_label'] for m in mnames_ok]
+            bcolors = [class_colors_map[l] for l in labels]
+            ecolors = [MODEL_COLORS[m] for m in mnames_ok]
+            bars_cf = axes_cmp[1].bar(mnames_ok, confs, color=bcolors, alpha=0.85,
+                                       width=0.45, edgecolor=ecolors, linewidth=2)
+            for bc2, lbl, cv in zip(bars_cf, labels, confs):
+                axes_cmp[1].text(bc2.get_x() + bc2.get_width()/2, bc2.get_height() + 1.0,
+                                  f'{lbl.upper()}\n{cv:.2f}%',
+                                  ha='center', va='bottom', color='#c9d8ed',
+                                  fontsize=9, fontweight='bold')
+            for ref, rlbl in [(50, '50%'), (80, '80%')]:
+                axes_cmp[1].axhline(y=ref, color='#38bdf8', linestyle='--', alpha=0.3, linewidth=1)
+                axes_cmp[1].text(len(mnames_ok) - 0.4, ref + 1, rlbl,
+                                  color='#38bdf8', fontsize=8, alpha=0.5)
+            axes_cmp[1].set_ylabel('Confidence (%)', color='#7ba4cc')
+            axes_cmp[1].set_title('Confidence Prediksi per Model\n(dari model nyata)', color='#c9d8ed', fontweight='bold')
+            axes_cmp[1].set_ylim(0, 115)
+            axes_cmp[1].set_facecolor('none')
+            axes_cmp[1].tick_params(colors='#c9d8ed')
+            axes_cmp[1].spines[:].set_color('#1e3a5f')
+            axes_cmp[1].grid(axis='y', alpha=0.15, color='#38bdf8')
+
+            for ax_cmp in axes_cmp: ax_cmp.set_facecolor('none')
+            fig_cmp.patch.set_alpha(0)
+            fig_cmp.tight_layout()
+            st.pyplot(fig_cmp, transparent=True)
+            plt.close()
+
+        # ── Perbandingan Grad-CAM semua model ─────────────────────────────────
+        gcam_models = [m for m in all_predictions if all_heatmaps.get(m) is not None]
+        if gcam_models:
+            st.markdown('<div class="section-header">🔥 Perbandingan Grad-CAM Semua Model</div>', unsafe_allow_html=True)
+            st.markdown("""
+            <div class="info-box">
+            Heatmap Grad-CAM di bawah ini dihasilkan langsung dari gradien model .h5 Anda menggunakan 
+            <code>GradientTape</code>. Area <span style="color:#ef4444;font-weight:700;">merah</span> 
+            menunjukkan piksel yang paling mempengaruhi keputusan model.
+            </div>
+            """, unsafe_allow_html=True)
+
+            ncols = 1 + len(gcam_models)
+            fig_gc, axes_gc = plt.subplots(1, ncols, figsize=(5 * ncols, 4.5), facecolor='none')
+            if ncols == 2: axes_gc = [axes_gc[0], axes_gc[1]]
+
+            axes_gc[0].imshow(np.array(pil_resized))
+            axes_gc[0].set_title('Input Asli\n(224×224)', color='#c9d8ed', fontsize=11, fontweight='bold')
+            axes_gc[0].axis('off')
+            axes_gc[0].set_facecolor('none')
+
+            for ax_gc, mname in zip(axes_gc[1:], gcam_models):
+                hm = all_heatmaps[mname]
+                gc_ov = overlay_gradcam(img_norm, hm, alpha=0.45)
+                ax_gc.imshow(gc_ov)
+                pred_lbl  = all_predictions[mname]['pred_label']
+                conf_val  = all_predictions[mname]['confidence']
+                ax_gc.set_title(f'{mname}\n{pred_lbl.upper()} ({conf_val*100:.2f}%)',
+                                 color=MODEL_COLORS[mname], fontsize=10, fontweight='bold')
+                ax_gc.axis('off')
+                ax_gc.set_facecolor('none')
+
+            fig_gc.patch.set_alpha(0)
+            fig_gc.suptitle('Grad-CAM Nyata — Gradien dari Layer Konvolusi Terakhir',
+                             color='#c9d8ed', fontweight='bold', fontsize=12)
+            fig_gc.tight_layout()
+            st.pyplot(fig_gc, transparent=True)
+            plt.close()
+
+            # Legenda warna
+            col_l1, col_l2, col_l3 = st.columns(3)
+            for col_l, (title, color, desc) in zip(
+                [col_l1, col_l2, col_l3],
+                [("🔴 Merah — Hot Spot", "#ef4444",
+                  "Area yang paling mempengaruhi prediksi. Gradien terbesar berada di sini."),
+                 ("🟡 Kuning-Hijau — Pendukung", "#eab308",
+                  "Area yang turut berkontribusi namun bukan penentu utama keputusan model."),
+                 ("🔵 Biru — Diabaikan", "#3b82f6",
+                  "Area yang dianggap tidak relevan oleh model untuk kelas yang diprediksi.")]
+            ):
+                with col_l:
+                    st.markdown(f"""
+                    <div style="padding:10px;background:rgba(0,0,0,0.2);
+                    border-left:3px solid {color};border-radius:0 8px 8px 0;margin-top:8px;">
+                        <div style="font-weight:700;color:{color};font-size:0.88rem;">{title}</div>
+                        <div style="font-size:0.8rem;color:#c9d8ed;margin-top:4px;">{desc}</div>
+                    </div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Analisis konsensus & interpretasi ─────────────────────────────────
+        st.markdown('<div class="section-header">🧠 Analisis & Interpretasi Hasil</div>', unsafe_allow_html=True)
+
+        pred_labels_all = [all_predictions[m]['pred_label'] for m in all_predictions]
+        label_counts_pred = Counter(pred_labels_all)
+        majority_label, majority_count = label_counts_pred.most_common(1)[0]
+
+        if majority_count == len(all_predictions):
+            st.markdown(f"""
+            <div class="success-box">
+            ✅ <strong>Konsensus Penuh — Semua model sepakat!</strong><br>
+            Seluruh model yang berhasil dijalankan memprediksi gambar ini sebagai 
+            <strong style="color:{class_colors_map[majority_label]};">{majority_label.upper()}</strong>. 
+            Prediksi ini sangat dapat dipercaya karena berasal dari arsitektur yang berbeda-beda 
+            namun menghasilkan kesimpulan yang sama.
+            </div>""", unsafe_allow_html=True)
+        elif majority_count >= 2:
+            minority = [m for m in all_predictions if all_predictions[m]['pred_label'] != majority_label]
+            st.markdown(f"""
+            <div class="warning-box">
+            ⚠️ <strong>Konsensus Mayoritas (tidak semua model sepakat)</strong><br>
+            Mayoritas model memprediksi 
+            <strong style="color:{class_colors_map[majority_label]};">{majority_label.upper()}</strong>, 
+            namun <strong>{', '.join(minority)}</strong> memberikan prediksi berbeda. 
+            Gunakan prediksi <strong>DenseNet121</strong> sebagai referensi utama (akurasi 92.5%).
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="warning-box">
+            ⚠️ <strong>Tidak ada konsensus</strong> — Semua model memberikan prediksi berbeda. 
+            Gambar kemungkinan memiliki elemen visual yang ambigu. 
+            Gunakan prediksi DenseNet121 sebagai acuan terpercaya.
+            </div>""", unsafe_allow_html=True)
+
+        # Analisis per model
+        analysis_texts = {
+            'VGG16': {
+                'positif': "VGG16 mendeteksi elemen visual yang berasosiasi dengan sentimen positif. Dengan akurasi 77.6%, model ini menggunakan fitur low-level (tepi, warna, tekstur) dari 16 layer konvolusinya. Fokus Grad-CAM pada area terang/cerah dalam gambar.",
+                'netral':  "VGG16 tidak menemukan elemen yang cukup kuat untuk dikategorikan positif maupun negatif. Arsitektur VGG16 yang lebih tradisional cenderung kurang tepat untuk sentimen halus — interpretasi ini perlu dikonfirmasi oleh DenseNet121.",
+                'negatif': "VGG16 mendeteksi elemen visual destruktif atau konfrontatif. Meskipun akurasinya hanya 77.6%, sentimen negatif yang kuat biasanya terdeteksi dengan baik oleh semua arsitektur karena fitur visualnya mencolok.",
+            },
+            'DenseNet121': {
+                'positif': "DenseNet121 — model dengan akurasi tertinggi (92.5%) — mengklasifikasikan gambar ini sebagai positif. Dense connections memungkinkan reuse fitur dari semua layer, sehingga model sangat sensitif terhadap nuansa visual seperti gestur damai dan komposisi warna harmonis.",
+                'netral':  "DenseNet121 mengidentifikasi gambar sebagai netral dengan kepercayaan tertinggi di antara ketiga model. Prediksi ini sangat dapat diandalkan — model berhasil mengenali bahwa gambar tidak mengandung trigger emosional yang signifikan.",
+                'negatif': "DenseNet121 mendeteksi sentimen negatif. Ini adalah prediksi yang paling kredibel karena DenseNet121 memiliki akurasi tertinggi (92.5%). Dense connections membuat model sangat sensitif terhadap pola destruktif, kekerasan, atau ekspresi agresif.",
+            },
+            'MobileNetV2': {
+                'positif': "MobileNetV2 memvalidasi sentimen positif dengan efisiensi tinggi. Model 13.2 MB ini menggunakan depthwise separable convolutions untuk menangkap fitur positif secara akurat, dengan akurasi kompetitif 90.6%.",
+                'netral':  "MobileNetV2 mengklasifikasikan gambar sebagai netral. Dengan arsitektur mobile-first yang efisien, model ini tidak menemukan elemen emosional yang dominan pada gambar.",
+                'negatif': "MobileNetV2 mendeteksi sentimen negatif dengan akurasi 90.6%. Meski model paling ringan, MobileNetV2 tetap mampu mengenali elemen destruktif dan konflik secara efektif.",
+            }
+        }
+        for mname, pred_info in all_predictions.items():
+            pred_lbl = pred_info['pred_label']
+            conf_v   = pred_info['confidence']
+            atext    = analysis_texts.get(mname, {}).get(pred_lbl, "Prediksi dihasilkan dari model nyata.")
+            st.markdown(f"""
+            <div style="padding:14px 16px;margin:8px 0;
+            background:rgba(56,189,248,0.04);
+            border:1px solid {MODEL_COLORS[mname]}40;
+            border-left:4px solid {MODEL_COLORS[mname]};border-radius:0 10px 10px 0;">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                    <span style="font-family:'Space Mono',monospace;font-weight:700;
+                    color:{MODEL_COLORS[mname]};font-size:1rem;">{mname}</span>
+                    <span style="background:{class_colors_map[pred_lbl]}20;
+                    color:{class_colors_map[pred_lbl]};
+                    border:1px solid {class_colors_map[pred_lbl]};
+                    padding:2px 10px;border-radius:999px;
+                    font-size:0.78rem;font-family:'Space Mono',monospace;">
+                        {pred_lbl.upper()} · {conf_v*100:.2f}%
+                    </span>
+                </div>
+                <div style="font-size:0.88rem;color:#c9d8ed;line-height:1.7;">{atext}</div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── Rekomendasi final ──────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        if 'DenseNet121' in all_predictions:
+            best_lbl  = all_predictions['DenseNet121']['pred_label']
+            best_conf = all_predictions['DenseNet121']['confidence']
+            rec_model = 'DenseNet121'
+        else:
+            # Fallback ke model dengan confidence tertinggi
+            rec_model = max(all_predictions, key=lambda m: all_predictions[m]['confidence'])
+            best_lbl  = all_predictions[rec_model]['pred_label']
+            best_conf = all_predictions[rec_model]['confidence']
+
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,rgba(56,189,248,0.1),rgba(129,140,248,0.1));
+        border:1px solid #38bdf8;border-radius:14px;padding:20px;">
+            <div style="font-family:'Space Mono',monospace;font-size:1rem;
+            color:#38bdf8;font-weight:700;margin-bottom:10px;">
+                🏆 Rekomendasi Prediksi Final (dari model nyata)
+            </div>
+            <div style="color:#c9d8ed;font-size:0.92rem;line-height:1.9;">
+                Prediksi terpercaya menggunakan 
+                <strong style="color:{MODEL_COLORS[rec_model]};">{rec_model}</strong> 
+                (akurasi tertinggi 92.5% pada test set penelitian ini):<br><br>
+                ▶ Sentimen:
+                <strong style="color:{class_colors_map[best_lbl]};font-size:1.2rem;
+                font-family:'Space Mono',monospace;"> {best_lbl.upper()} </strong>
+                &nbsp;|&nbsp; Confidence:
+                <strong style="color:{class_colors_map[best_lbl]};font-family:'Space Mono',monospace;">
+                    {best_conf*100:.2f}%
+                </strong>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    else:
+        # Placeholder jika belum upload
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="text-align:center;padding:60px 20px;
+        background:rgba(56,189,248,0.04);border:2px dashed #1e3a5f;border-radius:16px;">
+            <div style="font-size:4rem;margin-bottom:16px;">📷</div>
+            <div style="font-family:'Space Mono',monospace;color:#38bdf8;
+            font-size:1.1rem;font-weight:700;margin-bottom:8px;">
+                Belum Ada Gambar yang Diupload
+            </div>
+            <div style="color:#7ba4cc;font-size:0.9rem;max-width:500px;margin:0 auto;line-height:1.7;">
+                Upload gambar di atas untuk memulai uji coba. Sistem akan menjalankan prediksi 
+                <strong>nyata</strong> menggunakan model .h5 Anda dan menampilkan Grad-CAM 
+                dari gradien model sesungguhnya.
+            </div>
+            <br>
+            <div style="display:flex;justify-content:center;gap:20px;flex-wrap:wrap;margin-top:12px;">
+                <span style="color:#34d399;font-size:0.85rem;">😊 Sentimen Positif</span>
+                <span style="color:#60a5fa;font-size:0.85rem;">😐 Sentimen Netral</span>
+                <span style="color:#f87171;font-size:0.85rem;">😠 Sentimen Negatif</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+
 
 # ─── HALAMAN RINGKASAN & KESIMPULAN ───────────────────────────────────────────
 elif page == "📋 Ringkasan & Kesimpulan":
