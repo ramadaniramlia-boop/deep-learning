@@ -1,0 +1,4 @@
+Model,Accuracy,Precision,Recall,F1_Score,Size_MB
+VGG16,0.7760,0.7801,0.7760,0.7742,105.0
+DenseNet121,0.9252,0.9278,0.9252,0.9248,56.3
+MobileNetV2,0.9063,0.9091,0.9063,0.9057,13.2
