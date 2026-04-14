@@ -307,7 +307,7 @@ if page == "🏠 Beranda":
     with col3:
         st.markdown('<div class="metric-card"><div class="metric-label">Model Diuji</div><div class="metric-value">3</div><div class="metric-model">VGG16 · Dense · Mobile</div></div>', unsafe_allow_html=True)
     with col4:
-        st.markdown('<div class="metric-card"><div class="metric-label">Rekomendasi</div><div class="metric-value">MobileV2</div><div class="metric-model">Trade-off Terbaik</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-card"><div class="metric-label">Rekomendasi</div><div class="metric-value">DenseNet121</div><div class="metric-model">Trade-off Terbaik</div></div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     col_a, col_b = st.columns([3, 2])

@@ -3,6 +3,6 @@ numpy
 matplotlib
 seaborn
 pandas
-tensorflow
+tensorflow==2.15.0
 opencv-python-headless
-scikit-learn
+Pillow
